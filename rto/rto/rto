@@ -1,0 +1,194 @@
+import org.cloudbus.cloudsim.allocationpolicies.VmAllocationPolicyMigrationStaticThreshold;
+import org.cloudbus.cloudsim.brokers.DatacenterBrokerSimple;
+import org.cloudbus.cloudsim.cloudlets.Cloudlet;
+import org.cloudbus.cloudsim.cloudlets.CloudletSimple;
+import org.cloudbus.cloudsim.core.CloudSim;
+import org.cloudbus.cloudsim.datacenters.Datacenter;
+import org.cloudbus.cloudsim.datacenters.DatacenterSimple;
+import org.cloudbus.cloudsim.hosts.Host;
+import org.cloudbus.cloudsim.provisioners.PeProvisionerSimple;
+import org.cloudbus.cloudsim.resources.Pe;
+import org.cloudbus.cloudsim.resources.PeSimple;
+import org.cloudbus.cloudsim.utilizationmodels.UtilizationModelFull;
+import org.cloudbus.cloudsim.vms.Vm;
+import org.cloudbus.cloudsim.vms.VmSimple;
+import org.cloudsimplus.selectionpolicies.VmSelectionPolicyMinimumUtilization;
+
+import java.util.*;
+
+public class AutoVmMigrationRtoRpoRealistic {
+    private static Datacenter dc1, dc2;
+    private static DatacenterBrokerSimple broker;
+    private static double dc1FailureTime = 20; // seconds
+    private static double rtoStartTime = 0;
+    private static double rtoEndTime = 0;
+    private static Map<Integer, Double> lastCheckpoint = new HashMap<>();
+    private static double checkpointInterval = 5; // seconds
+
+    public static void main(String[] args) {
+        System.out.println("Starting CloudSim Plus simulation...");
+
+        CloudSim simulation = new CloudSim();
+
+        dc1 = createDatacenter(simulation, "DC-1");
+        dc2 = createDatacenter(simulation, "DC-2");
+        broker = new DatacenterBrokerSimple(simulation);
+
+        List<Vm> vmList = createVms(4);
+        List<Cloudlet> cloudletList = createCloudlets(4);
+        broker.submitVmList(vmList);
+        broker.submitCloudletList(cloudletList);
+
+        // Periodic checkpoint simulation
+        simulation.addOnClockTickListener(evt -> {
+            double time = evt.getTime();
+
+            // Record cloudlet progress every checkpointInterval
+            if (Math.floor(time) % checkpointInterval == 0) {
+                for (Cloudlet c : broker.getCloudletSubmittedList()) {
+                    lastCheckpoint.put(c.getId(), c.getFinishedLengthSoFar());
+                }
+                System.out.printf("[%.2f] Checkpoint saved for %d Cloudlets\n",
+                        time, lastCheckpoint.size());
+            }
+
+            // Fail DC1 at scheduled time
+            if (Math.abs(time - dc1FailureTime) < 0.001) {
+                System.out.printf("\n--- DC1 FAILURE detected at %.2f sec ---\n", time);
+                shutdownDatacenter(dc1);
+                rtoStartTime = time;
+
+                System.out.println("Starting automatic migration to DC2...");
+                migrateVmsTo(dc2, vmList, simulation);
+                rtoEndTime = simulation.clock(); // end of recovery
+            }
+        });
+
+        simulation.start();
+
+        calculateRtoRpo(simulation, cloudletList);
+        printResults(cloudletList);
+    }
+
+    // ---------- Datacenter ----------
+    private static Datacenter createDatacenter(CloudSim simulation, String name) {
+        List<Host> hostList = new ArrayList<>();
+        for (int i = 0; i < 2; i++) {
+            List<Pe> peList = new ArrayList<>();
+            for (int j = 0; j < 4; j++)
+                peList.add(new PeSimple(1000, new PeProvisionerSimple()));
+
+            Host host = new org.cloudbus.cloudsim.hosts.HostSimple(8000, 8000, 100000)
+                    .setPeList(peList);
+            hostList.add(host);
+        }
+
+        DatacenterSimple dc = new DatacenterSimple(simulation, hostList,
+                new VmAllocationPolicyMigrationStaticThreshold(
+                        new VmSelectionPolicyMinimumUtilization(),
+                        0.8
+                ));
+
+        dc.setName(name);
+        System.out.println(name + " created with " + hostList.size() + " hosts");
+        return dc;
+    }
+
+    // ---------- VM & Cloudlet ----------
+    private static List<Vm> createVms(int count) {
+        List<Vm> vmList = new ArrayList<>();
+        for (int i = 0; i < count; i++) {
+            Vm vm = new VmSimple(i, 1000, 2);
+            vm.setRam(1024).setBw(1000).setSize(10000);
+            vmList.add(vm);
+        }
+        return vmList;
+    }
+
+    private static List<Cloudlet> createCloudlets(int count) {
+        List<Cloudlet> list = new ArrayList<>();
+        UtilizationModelFull um = new UtilizationModelFull();
+        for (int i = 0; i < count; i++) {
+            Cloudlet cloudlet = new CloudletSimple(10000, 2, um);
+            cloudlet.setId(i);
+            cloudlet.setFileSize(300);
+            cloudlet.setOutputSize(300);
+            list.add(cloudlet);
+        }
+        return list;
+    }
+
+    // ---------- Migration ----------
+    private static void migrateVmsTo(Datacenter targetDc, List<Vm> vmList, CloudSim simulation) {
+        for (Vm vm : vmList) {
+            try {
+                Host targetHost = targetDc.getHostList().stream()
+                        .filter(h -> h.isSuitableForVm(vm))
+                        .findFirst().orElse(null);
+
+                if (targetHost == null) {
+                    System.out.printf("No suitable host found in %s for VM %d\n", targetDc.getName(), vm.getId());
+                    continue;
+                }
+
+                if (vm.getHost() != null) vm.getHost().destroyVm(vm);
+                targetHost.createVm(vm);
+
+                System.out.printf("VM %d migrated to %s (Host %d) at %.2f sec\n",
+                        vm.getId(), targetDc.getName(), targetHost.getId(), simulation.clock());
+            } catch (Exception e) {
+                System.err.printf("Migration of VM %d failed: %s\n", vm.getId(), e.getMessage());
+            }
+        }
+    }
+
+    // ---------- Shutdown ----------
+    private static void shutdownDatacenter(Datacenter dc) {
+        System.out.println("Shutting down " + dc.getName());
+        dc.getHostList().forEach(host -> {
+            for (Vm vm : new ArrayList<>(host.getVmList())) {
+                for (Cloudlet c : vm.getCloudletScheduler().getCloudletList()) {
+                    // Store data loss as difference between progress and last checkpoint
+                    double finished = c.getFinishedLengthSoFar();
+                    double lastSaved = lastCheckpoint.getOrDefault(c.getId(), 0.0);
+                    double lost = finished - lastSaved;
+                    if (lost > 0)
+                        System.out.printf("Cloudlet %d lost %.2f MI of work since last checkpoint.\n", c.getId(), lost);
+                }
+                host.destroyVm(vm);
+            }
+        });
+    }
+
+    // ---------- RTO/RPO ----------
+    private static void calculateRtoRpo(CloudSim simulation, List<Cloudlet> cloudletList) {
+        double rto = (rtoEndTime > rtoStartTime) ? (rtoEndTime - rtoStartTime) : 0;
+
+        double totalLost = 0, totalLength = 0;
+        for (Cloudlet c : cloudletList) {
+            double finished = c.getFinishedLengthSoFar();
+            double lastSaved = lastCheckpoint.getOrDefault(c.getId(), 0.0);
+            double lost = Math.max(0, c.getLength() - finished);
+            totalLost += lost;
+            totalLength += c.getLength();
+        }
+
+        double rpoPercent = (totalLost / totalLength) * 100;
+
+        System.out.printf("\n--- RTO/RPO Summary ---\n");
+        System.out.printf("Recovery Time Objective (RTO): %.2f sec\n", rto);
+        System.out.printf("Recovery Point Objective (RPO): %.2f%% of workload lost\n", rpoPercent);
+    }
+
+    // ---------- Results ----------
+    private static void printResults(List<Cloudlet> list) {
+        System.out.println("\nFinal Cloudlet Results:");
+        for (Cloudlet c : list) {
+            System.out.printf("Cloudlet %d finished on VM %d at %.2f sec, status: %s\n",
+                    c.getId(),
+                    c.getVm() == null ? -1 : c.getVm().getId(),
+                    c.getFinishTime(),
+                    c.getStatus());
+        }
+    }
+}
