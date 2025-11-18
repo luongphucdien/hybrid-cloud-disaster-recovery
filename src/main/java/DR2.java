@@ -16,9 +16,6 @@ import java.util.*;
 
 public class DR2 {
     private static boolean failoverFlag = false;
-    private static boolean summaryFlag = false;
-    private static int VM_NUMBER = 4;
-    private static int CLOUDLET_NUMBER = 8;
     
     public static void main(String[] args) {
         final Map<Long, String> vmIntegrityMap = new HashMap<>();
@@ -41,10 +38,10 @@ public class DR2 {
         DatacenterBrokerSimple broker = new DatacenterBrokerSimple(simulation);
         
         // VMs
-        List<VmSimple> vms = createVms(VM_NUMBER);
+        List<VmSimple> vms = createVms(Config.VMConfig.NUMBER);
         
         // Cloudlets
-        List<CloudletSimple> cloudlets = createCloudlets(CLOUDLET_NUMBER);
+        List<CloudletSimple> cloudlets = createCloudlets(Config.CloudletConfig.NUMBER);
         
         // Submit
         broker.submitVmList(vms);
@@ -58,6 +55,10 @@ public class DR2 {
             );
         }
         
+        System.out.println("==========CONFIG==========");
+        System.out.print(Config.asString());
+        System.out.println("==========END CONFIG==========");
+        
         // Run Simulation
         simulation.addOnClockTickListener(event -> {
             double time = simulation.clock();
@@ -66,6 +67,19 @@ public class DR2 {
             // Main Simulation
             if(time >= failTime && !failoverFlag) {
                 failoverFlag = true;
+                
+                System.out.println("<INIT> VMs created: " + broker.getVmCreatedList());
+                System.out.println("<INIT> Cloudlets created: " +
+                        broker.getCloudletSubmittedList());
+                
+                System.out.println("<INIT> VMs and their hashes:");
+                for(Map.Entry<Long, String> entry : vmIntegrityMap.entrySet()) {
+                    System.out.printf(
+                            "<INIT> VM=%d | Hash=%s%n",
+                            entry.getKey(),
+                            entry.getValue()
+                    );
+                }
                 
                 System.out.printf(
                         "==========FAILURE AT T=%.3f==========%n",
@@ -93,6 +107,10 @@ public class DR2 {
                         System.currentTimeMillis()
                 );
                 rq.setSignature(securityAuthority.sign(rq));
+                System.out.printf(
+                        "<MIGRATION-REQUEST> Signature: %s%n",
+                        rq.getSignature()
+                );
                 
                 // Verify signature/auth
                 if(!securityAuthority.verify(rq)) {
@@ -138,19 +156,24 @@ public class DR2 {
                                     .getCapacity())
                             .setCloudletScheduler(new CloudletSchedulerSpaceShared());
                     
-                    // Broker submits new VM one by one
+                    // Add VM to migrating list
                     newVms.add(newVm);
                     
                     System.out.printf(
-                            "<INFO> VM %d integrity OK%n",
-                            oldId
+                            "<VM-MIGRATION> VM %d integrity OK | Expected: %s | Got: %s%n",
+                            oldId,
+                            expectedHash,
+                            currentHash
                     );
                 }
+                
+                // Broker submits migrating VMs to available DC (public-dc)
                 broker.submitVmList(newVms);
                 
                 // Rebind cloudlets
                 for(CloudletSimple cloudlet : cloudlets) {
-                    VmSimple vmToBeBound = newVms.get((int) (cloudlet.getId() % VM_NUMBER));
+                    VmSimple vmToBeBound = newVms.get((int) (cloudlet.getId() %
+                            Config.VMConfig.NUMBER));
                     
                     if(!cloudlet.isFinished()) {
                         broker.bindCloudletToVm(
@@ -160,7 +183,7 @@ public class DR2 {
                     }
                     
                     System.out.printf(
-                            "<INFO> Rebind cloudlet %d to VM %d%n",
+                            "<CLOUDLET-REBIND> Rebind cloudlet %d to VM %d%n",
                             cloudlet.getId(),
                             vmToBeBound.getId()
                     );
@@ -210,19 +233,15 @@ public class DR2 {
         List<Host> hostList = new ArrayList<>();
         List<Pe> peList = new ArrayList<>();
         
-        int PE_NUMBER = 4;
-        double PE_MIPS_CAPACITY = 2000;
-        for(int i = 0; i < PE_NUMBER; i++) {
-            peList.add(new PeSimple(PE_MIPS_CAPACITY));
+        for(int i = 0; i < Config.DatacenterConfig.PE_NUMBER; i++) {
+            peList.add(new PeSimple(Config.DatacenterConfig.PE_MIPS_CAPACITY));
         }
         
-        int HOST_NUMBER = 4;
-        long HOST_RAM = 1024 * 16, HOST_BW = 10_000, HOST_STORAGE = 1_000_000;
-        for(int i = 0; i < HOST_NUMBER; i++) {
+        for(int i = 0; i < Config.DatacenterConfig.HOST_NUMBER; i++) {
             HostSimple host = new HostSimple(
-                    HOST_RAM,
-                    HOST_BW,
-                    HOST_STORAGE,
+                    Config.DatacenterConfig.HOST_RAM,
+                    Config.DatacenterConfig.HOST_BW,
+                    Config.DatacenterConfig.HOST_STORAGE,
                     peList
             );
             hostList.add(host);
@@ -239,17 +258,15 @@ public class DR2 {
     private static List<VmSimple> createVms(int count) {
         List<VmSimple> vms = new ArrayList<>();
         
-        double VM_MIPS_CAPACITY = 1000;
-        long VM_PE_NUMBER = 1, VM_RAM = 1024 * 2, VM_BW = 1000, VM_STORAGE = 10_000;
         for(int i = 0; i < count; i++) {
             VmSimple vm = new VmSimple(
-                    VM_MIPS_CAPACITY,
-                    VM_PE_NUMBER
+                    Config.VMConfig.MIPS_CAPACITY,
+                    Config.VMConfig.PE_NUMBER
             );
             vm
-                    .setRam(VM_RAM)
-                    .setBw(VM_BW)
-                    .setSize(VM_STORAGE)
+                    .setRam(Config.VMConfig.RAM)
+                    .setBw(Config.VMConfig.BW)
+                    .setSize(Config.VMConfig.STORAGE)
                     .setCloudletScheduler(new CloudletSchedulerSpaceShared());
             vms.add(vm);
         }
@@ -259,16 +276,14 @@ public class DR2 {
     private static List<CloudletSimple> createCloudlets(int count) {
         List<CloudletSimple> cloudlets = new ArrayList<>();
         
-        long CLOUDLET_LENGTH = 10_000, CLOUDLET_FILE_SIZE = 300, CLOUDLET_OUTPUT_SIZE = 300;
-        int CLOUDLET_PE_NUMBER = 1;
         for(int i = 0; i < count; i++) {
             CloudletSimple cloudlet = new CloudletSimple(
-                    CLOUDLET_LENGTH,
-                    CLOUDLET_PE_NUMBER
+                    Config.CloudletConfig.LENGTH,
+                    Config.CloudletConfig.PE_NUMBER
             );
             cloudlet
-                    .setFileSize(CLOUDLET_FILE_SIZE)
-                    .setOutputSize(CLOUDLET_OUTPUT_SIZE);
+                    .setFileSize(Config.CloudletConfig.FILE_SIZE)
+                    .setOutputSize(Config.CloudletConfig.OUTPUT_SIZE);
             cloudlets.add(cloudlet);
         }
         return cloudlets;
@@ -277,17 +292,15 @@ public class DR2 {
     private static void printFinalCloudletStatus(DatacenterBrokerSimple broker) {
         broker
                 .getCloudletFinishedList()
-                .forEach(cloudlet -> {
-                    System.out.printf(
-                            "<CLOUDLET-LOG> Cloudlet %d finished on VM %d at %.3f, status=%s%n",
-                            cloudlet.getId(),
-                            cloudlet.getVm() != Vm.NULL ? cloudlet
-                                    .getVm()
-                                    .getId() : -1,
-                            cloudlet.getFinishTime(),
-                            cloudlet.getStatus()
-                    );
-                });
+                .forEach(cloudlet -> System.out.printf(
+                        "<CLOUDLET-LOG> Cloudlet %d finished on VM %d at %.3f, status=%s%n",
+                        cloudlet.getId(),
+                        cloudlet.getVm() != Vm.NULL ? cloudlet
+                                .getVm()
+                                .getId() : -1,
+                        cloudlet.getFinishTime(),
+                        cloudlet.getStatus()
+                ));
     }
     
     static class IntegrityChecker {
@@ -353,7 +366,7 @@ public class DR2 {
     
     // Rough simulated authority (Secret + Message). IRL uses asymmetric signatures and KMS
     static class SecurityAuthority {
-        private final String secret = "";
+        private final String secret = "guiyixiajiaowobaba";
         
         private String computeHash(String string) {
             try {

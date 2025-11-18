@@ -41,3 +41,4 @@ build/
 metrics.csv
 backups.csv
 originals.csv
+logs.txt
